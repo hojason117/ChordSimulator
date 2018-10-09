@@ -24,10 +24,10 @@ defmodule ChordSimulator.Supervisor do
 
       manager = Supervisor.child_spec({ChordSimulator.Manager, Map.merge(share_arg, %{total_nodes: total_nodes, daemon: arg})}, restart: :transient)
 
-      participants = Enum.reduce(total_nodes..1, [],
-        fn(x, acc) -> [Supervisor.child_spec({ChordSimulator.Node, [share_arg, x]}, id: {ChordSimulator.Node, x}, restart: :transient) | acc] end)
+      nodes = Enum.reduce(total_nodes..1, [],
+        fn(x, acc) -> [Supervisor.child_spec({ChordSimulator.Node, [share_arg, x]}, id: {ChordSimulator.Node, x}, restart: :temporary) | acc] end)
 
-      children = [registry | [manager | participants]]
+      children = [registry | [manager | nodes]]
 
       Supervisor.init(children, strategy: :one_for_one)
     end

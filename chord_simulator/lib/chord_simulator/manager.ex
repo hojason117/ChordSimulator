@@ -11,12 +11,17 @@ defmodule ChordSimulator.Manager do
 
   def init(arg) do
     nodes_checklist = Enum.reduce(1..arg.total_nodes, %{}, fn(x, acc) -> Map.put(acc, "node_#{x}", false) end)
-    state = Map.merge(arg, %{nodes_checklist: nodes_checklist, nodes_finished: 0})
+    state = Map.merge(arg, %{joined_nodes: [], joined_nodes_count: 0, nodes_checklist: nodes_checklist, nodes_finished: 0})
     {:ok, state}
   end
 
-  def handle_call(:get_random_entry_node, from, state) do
-
+  def handle_call({:get_random_entry_node_n_join, node}, _from, state) do
+    new_state = Map.merge(state, %{joined_nodes: [node | state.joined_nodes], joined_nodes_count: state.joined_nodes_count + 1})
+    if state.joined_nodes_count == 0 do
+      {:reply, nil, new_state}
+    else
+      {:reply, Enum.random(state.joined_nodes), new_state}
+    end
   end
 
   def handle_call({:node_finish, node, average_hop}, from, state) do
