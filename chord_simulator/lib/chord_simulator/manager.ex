@@ -20,6 +20,7 @@ defmodule ChordSimulator.Manager do
     if state.joined_nodes_count == 0 do
       {:reply, nil, new_state}
     else
+      if new_state.joined_nodes_count == new_state.total_nodes, do: IO.puts "All nodes have joined the network."
       {:reply, Enum.random(state.joined_nodes), new_state}
     end
   end

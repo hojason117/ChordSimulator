@@ -6,7 +6,8 @@ defmodule ChordSimulator.Node do
 
   @hash_func :sha
   @hash_digest 160
-  @truncated_digest 4
+  @truncated_digest 40
+  @max_id trunc(:math.pow(2, @truncated_digest))
   @stabilize_period 50
   @check_predecessor_period 50
   @fix_fingers_period 50
@@ -25,14 +26,15 @@ defmodule ChordSimulator.Node do
   def init(arg) do
     GenServer.cast(self(), :start)
     remain_digest = @hash_digest - @truncated_digest
-    <<x::@truncated_digest, _::size(remain_digest)>> = :crypto.hash(@hash_func, "node_#{arg.id}")
+    <<_::size(remain_digest), x::@truncated_digest>> = :crypto.hash(@hash_func, "node_#{arg.id}")
     x_bits = <<x::@truncated_digest>>
     fail_node = if arg.fail_mode and Enum.random(1..100) <= arg.fail_rate, do: true, else: false
+    finger = Enum.reduce(1..@truncated_digest, [], fn(_, acc) -> [nil|acc] end)
     state = Map.merge(arg, %{
       self: %Peer{name: "node_#{arg.id}", hash: x_bits},
       predecessor: nil,
       successor: nil,
-      finger: [],
+      finger: finger,
       fail_node: fail_node,
       total_hops: 0,
       alive: true
@@ -49,38 +51,36 @@ defmodule ChordSimulator.Node do
     {:noreply, new_state}
   end
 
-  def handle_call({:find_successor, id}, _from, state), do: {:reply, find_successor(state, id), state}
+  def handle_cast({:find_successor, id, callee, hops}, state) do
+    find_successor(state, id, callee, hops + 1)
+    {:noreply, state}
+  end
+
+  def handle_call({:new_state, key, value}, _from, state), do: {:reply, :ok, Map.put(state, key, value)}
+
+  def handle_call({:find_successor, id}, from, state) do
+    find_successor(state, id, from, 1)
+    {:noreply, state}
+  end
 
   def handle_call(:predecessor, _from, state), do: {:reply, state.predecessor, state}
 
   def handle_call({:notify, node}, _from, state), do: {:reply, :ok, notify(state, node)}
 
   def handle_info(:stabilize, state) do
-    if state.alive do
-      spawn_link(fn() -> stabilize(state) end)
-      Process.send_after(self(), :stabilize, @stabilize_period)
-    end
+    if state.alive, do: spawn_link(fn() -> stabilize(state) end)
     {:noreply, state}
   end
 
   def handle_info(:check_predecessor, state) do
-    if state.alive do
-      spawn_link(fn() -> check_predecessor(state) end)
-      Process.send_after(self(), :check_predecessor, @check_predecessor_period)
-    end
+    if state.alive, do: spawn_link(fn() -> check_predecessor(state) end)
     {:noreply, state}
   end
 
   def handle_info({:fix_fingers, next}, state) do
-    if state.alive do
-      spawn_link(fn() -> fix_fingers(state, next) end)
-      next = if next + 1 >= @truncated_digest, do: 0, else: next + 1
-      Process.send_after(self(), {:fix_fingers, next}, @fix_fingers_period)
-    end
+    if state.alive, do: spawn_link(fn() -> fix_fingers(state, next) end)
     {:noreply, state}
   end
-
-  def handle_info({:new_state, new_state}, _state), do: {:noreply, new_state}
 
   def terminate(reason, state) do
     if reason == :normal do
@@ -95,13 +95,26 @@ defmodule ChordSimulator.Node do
 
   defp find_successor(state, id) do
     if in_range?(id, state.self.hash, false, state.successor.hash, true) do
-      state.successor
+      {state.successor, 0}
     else
       cpn = closest_preceding_node(state, id, @truncated_digest - 1)
       if cpn == state.self do
-        state.self
+        {state.self, 0} # TODO
       else
         GenServer.call({:via, Registry, {ChordSimulator.Registry, cpn.name}}, {:find_successor, id})
+      end
+    end
+  end
+
+  defp find_successor(state, id, callee, hops) do
+    if in_range?(id, state.self.hash, false, state.successor.hash, true) do
+      GenServer.reply(callee, {state.successor, hops})
+    else
+      cpn = closest_preceding_node(state, id, @truncated_digest - 1)
+      if cpn == state.self do
+        GenServer.reply(callee, {state.self, hops}) # TODO
+      else
+        GenServer.cast({:via, Registry, {ChordSimulator.Registry, cpn.name}}, {:find_successor, id, callee, hops})
       end
     end
   end
@@ -121,17 +134,24 @@ defmodule ChordSimulator.Node do
   end
 
   defp join(state, entry_node) do
-    successor = GenServer.call({:via, Registry, {ChordSimulator.Registry, entry_node.name}}, {:find_successor, state.self.hash})
+    {successor, _} = GenServer.call({:via, Registry, {ChordSimulator.Registry, entry_node.name}}, {:find_successor, state.self.hash})
     Map.merge(state, %{predecessor: nil, successor: successor})
   end
 
   defp stabilize(state) do
-    # IO.puts "#{state.self.name}\n#{inspect(state.predecessor)}\n#{inspect(state.successor)}"
-
     x = GenServer.call({:via, Registry, {ChordSimulator.Registry, state.successor.name}}, :predecessor)
-    new_state = if x != nil and in_range?(x.hash, state.self.hash, false, state.successor.hash, false), do: Map.put(state, :successor, x), else: state
-    :ok = GenServer.call({:via, Registry, {ChordSimulator.Registry, new_state.successor.name}}, {:notify, new_state.self})
-    Process.send(self(), {:new_state, new_state}, [])
+
+    new_successor =
+      if x != nil and in_range?(x.hash, state.self.hash, false, state.successor.hash, false) do
+        :ok = GenServer.call({:via, Registry, {ChordSimulator.Registry, state.self.name}}, {:new_state, :successor, x})
+        x
+      else
+        state.successor
+      end
+
+    :ok = GenServer.call({:via, Registry, {ChordSimulator.Registry, new_successor.name}}, {:notify, state.self})
+
+    Process.send_after(Registry.lookup(ChordSimulator.Registry, state.self.name) |> Enum.at(0) |> elem(0), :stabilize, @stabilize_period)
   end
 
   defp notify(state, node) do
@@ -144,36 +164,39 @@ defmodule ChordSimulator.Node do
 
   defp fix_fingers(state, next) do
     <<id_int::@truncated_digest>> = state.self.hash
-    id_int = rem(id_int + trunc(:math.pow(2, next)), @truncated_digest)
+    id_int = rem(id_int + trunc(:math.pow(2, next)), @max_id)
     id = <<id_int::@truncated_digest>>
-    new_finger = List.replace_at(state.finger, next, find_successor(state, id))
-    new_state = Map.put(state, :finger, new_finger)
-    Process.send(self(), {:new_state, new_state}, [])
+    {successor, _} = find_successor(state, id)
+    new_finger = List.replace_at(state.finger, next, successor)
+    :ok = GenServer.call({:via, Registry, {ChordSimulator.Registry, state.self.name}}, {:new_state, :finger, new_finger})
+
+    next = if next + 1 >= @truncated_digest, do: 0, else: next + 1
+    Process.send_after(Registry.lookup(ChordSimulator.Registry, state.self.name) |> Enum.at(0) |> elem(0), {:fix_fingers, next}, @fix_fingers_period)
   end
 
   defp check_predecessor(state) do
-    new_state =
-      if state.predecessor != nil and GenServer.whereis({:via, Registry, {ChordSimulator.Registry, state.predecessor.name}}) == nil do
-        Map.put(state, :predecessor, nil)
-      else
-        state
-      end
-    Process.send(self(), {:new_state, new_state}, [])
+    if state.predecessor != nil and GenServer.whereis({:via, Registry, {ChordSimulator.Registry, state.predecessor.name}}) == nil do
+      :ok = GenServer.call({:via, Registry, {ChordSimulator.Registry, state.self.name}}, {:new_state, :predecessor, nil})
+    end
+    Process.send_after(Registry.lookup(ChordSimulator.Registry, state.self.name) |> Enum.at(0) |> elem(0), :check_predecessor, @check_predecessor_period)
   end
 
   defp in_range?(target, left, left_inclusive, right, right_inclusive) do
-    if left > right do
-      if target > right and target < left do
-        false
-      else
-        if (target == left and left_inclusive) or (target == right and right_inclusive), do: true, else: false
-      end
-    else
-      if target >= left and target <= right do
-        if (target == left and not left_inclusive) or (target == right and not right_inclusive), do: false, else: true
-      else
-        false
-      end
+    cond do
+      left < right ->
+        if target >= left and target <= right do
+          if (target == left and not left_inclusive) or (target == right and not right_inclusive), do: false, else: true
+        else
+          false
+        end
+      left == right ->
+        if target == left and (not left_inclusive or not right_inclusive), do: false, else: true
+      left > right ->
+        if target > right and target < left do
+          false
+        else
+          if (target == left and not left_inclusive) or (target == right and not right_inclusive), do: false, else: true
+        end
     end
   end
 end
