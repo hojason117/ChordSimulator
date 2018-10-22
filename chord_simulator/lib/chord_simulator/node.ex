@@ -10,7 +10,7 @@ defmodule ChordSimulator.Node do
   @max_id trunc(:math.pow(2, @truncated_digest))
   @stabilize_period 50
   @check_predecessor_period 50
-  @fix_fingers_period 50
+  @fix_fingers_period 20
 
   use GenServer
 
@@ -25,9 +25,7 @@ defmodule ChordSimulator.Node do
 
   def init(arg) do
     GenServer.cast(self(), :start)
-    remain_digest = @hash_digest - @truncated_digest
-    <<_::size(remain_digest), x::@truncated_digest>> = :crypto.hash(@hash_func, "node_#{arg.id}")
-    x_bits = <<x::@truncated_digest>>
+    x_bits = get_hash("node_#{arg.id}")
     fail_node = if arg.fail_mode and Enum.random(1..100) <= arg.fail_rate, do: true, else: false
     finger = Enum.reduce(1..@truncated_digest, [], fn(_, acc) -> [nil|acc] end)
     state = Map.merge(arg, %{
@@ -37,23 +35,35 @@ defmodule ChordSimulator.Node do
       finger: finger,
       fail_node: fail_node,
       total_hops: 0,
-      alive: true
+      message_sent: 0,
+      alive: not fail_node
     })
     {:ok, state}
   end
 
   def handle_cast(:start, state) do
-    entry_node = GenServer.call(ChordSimulator.Manager, {:get_random_entry_node_n_join, state.self})
+    entry_node = GenServer.call(ChordSimulator.Manager, :get_random_entry_node)
     new_state = if entry_node == nil, do: create(state), else: join(state, entry_node)
+    :ok = GenServer.call(ChordSimulator.Manager, {:node_joined, new_state.self})
+    {:noreply, new_state}
+  end
+
+  def handle_cast(:all_node_joined, state) do
     Process.send_after(self(), :stabilize, @stabilize_period)
     Process.send_after(self(), :check_predecessor, @check_predecessor_period)
     Process.send_after(self(), {:fix_fingers, 0}, @fix_fingers_period)
-    {:noreply, new_state}
+    Process.send_after(self(), :message, 5000)
+    {:noreply, state}
   end
 
   def handle_cast({:find_successor, id, callee, hops}, state) do
     find_successor(state, id, callee, hops + 1)
     {:noreply, state}
+  end
+
+  def handle_cast(:terminate, state) do
+    new_state = Map.put(state, :alive, false)
+    {:stop, :normal, new_state}
   end
 
   def handle_call({:new_state, key, value}, _from, state), do: {:reply, :ok, Map.put(state, key, value)}
@@ -68,27 +78,37 @@ defmodule ChordSimulator.Node do
   def handle_call({:notify, node}, _from, state), do: {:reply, :ok, notify(state, node)}
 
   def handle_info(:stabilize, state) do
-    if state.alive, do: spawn_link(fn() -> stabilize(state) end)
+    if state.alive and not state.fail_node, do: spawn_link(fn() -> stabilize(state) end)
     {:noreply, state}
   end
 
   def handle_info(:check_predecessor, state) do
-    if state.alive, do: spawn_link(fn() -> check_predecessor(state) end)
+    if state.alive and not state.fail_node, do: spawn_link(fn() -> check_predecessor(state) end)
     {:noreply, state}
   end
 
   def handle_info({:fix_fingers, next}, state) do
-    if state.alive, do: spawn_link(fn() -> fix_fingers(state, next) end)
+    if state.alive and not state.fail_node, do: spawn_link(fn() -> fix_fingers(state, next) end)
     {:noreply, state}
   end
 
-  def terminate(reason, state) do
-    if reason == :normal do
-      average_hop = state.total_hops / state.num_requests
-      :ok = GenServer.call(ChordSimulator.Manager, {:node_finish, state.self_name, average_hop})
-    else
-      IO.inspect(reason)
+  def handle_info(:message, state) do
+    cond do
+      state.message_sent == state.num_requests ->
+        average_hop = state.total_hops / state.num_requests
+        :ok = GenServer.call(ChordSimulator.Manager, {:node_finish, state.self.name, average_hop})
+      not state.fail_node ->
+        message = Enum.reduce(1..10, "", fn(_, acc) -> acc <> <<Enum.random(0..255)>> end)
+        message_hash = get_hash(message)
+        spawn_link(fn() -> send_message(state, message_hash) end)
+        Process.send_after(self(), :message, 1000)
     end
+    {:noreply, state}
+  end
+
+  def terminate(reason, _state) do
+    if reason != :normal, do: IO.inspect(reason)
+    :timer.sleep(1000)
   end
 
   # Aux
@@ -181,6 +201,12 @@ defmodule ChordSimulator.Node do
     Process.send_after(Registry.lookup(ChordSimulator.Registry, state.self.name) |> Enum.at(0) |> elem(0), :check_predecessor, @check_predecessor_period)
   end
 
+  defp send_message(state, message_hash) do
+    {_result, hops} = find_successor(state, message_hash)
+    :ok = GenServer.call({:via, Registry, {ChordSimulator.Registry, state.self.name}}, {:new_state, :total_hops, state.total_hops + hops})
+    :ok = GenServer.call({:via, Registry, {ChordSimulator.Registry, state.self.name}}, {:new_state, :message_sent, state.message_sent + 1})
+  end
+
   defp in_range?(target, left, left_inclusive, right, right_inclusive) do
     cond do
       left < right ->
@@ -198,5 +224,11 @@ defmodule ChordSimulator.Node do
           if (target == left and not left_inclusive) or (target == right and not right_inclusive), do: false, else: true
         end
     end
+  end
+
+  defp get_hash(input) do
+    remain_digest = @hash_digest - @truncated_digest
+    <<_::size(remain_digest), x::@truncated_digest>> = :crypto.hash(@hash_func, input)
+    <<x::@truncated_digest>>
   end
 end

@@ -1,8 +1,5 @@
 # ChordSimulator
 
-### Group Info:
-Chia-Hsien Ho (90679958)
-
 ### Instructions:
 ```sh
 cd chord_simulator/
